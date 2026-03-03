@@ -1,0 +1,10 @@
+# Cloud Build source upload rules.
+# pnpm-lock.yaml is now committed, so no special overrides needed.
+# Skip large dirs irrelevant to the Docker build.
+.gcloudignore
+#!include:.gitignore
+
+docs/
+scripts/docker/
+scripts/e2e/
+.git/
