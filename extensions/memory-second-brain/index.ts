@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { getAgentProjects } from "./src/db.js";
+import { getAgentProjects, getSkillSecrets } from "./src/db.js";
 import { loadContext } from "./src/load.js";
 import { flushDailyLog, writeMemoryFile } from "./src/save.js";
 import { listSkills, writeSkill } from "./src/skills.js";
@@ -22,6 +22,7 @@ import type { PluginConfig } from "./src/types.js";
 //     (where OpenClaw reads and RAG indexes)
 //   - write_skill tool: LLM creates/updates personal skills
 //   - list_skills tool: LLM lists available org + personal skills
+//   - web_search tool: search the web via Brave Search (key from skill_secrets)
 // ---------------------------------------------------------------------------
 
 const memorySecondBrainPlugin = {
@@ -278,6 +279,133 @@ const memorySecondBrainPlugin = {
         },
       },
       { name: "write_skill" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Tool: web_search — search the web via Brave Search API
+    // API key loaded from skill_secrets table, never exposed to LLM
+    // -----------------------------------------------------------------------
+
+    let skillSecrets: Map<string, Map<string, string>> = new Map();
+
+    api.on("before_agent_start", async () => {
+      try {
+        skillSecrets = await getSkillSecrets(cfg);
+      } catch (err) {
+        api.logger.warn(`[memory-second-brain] failed to load skill secrets: ${String(err)}`);
+      }
+      return undefined;
+    });
+
+    api.registerTool(
+      {
+        name: "web_search",
+        label: "Web Search",
+        description:
+          "Search the web for current information using Brave Search. " +
+          "Returns titles, URLs, and snippets for the top results. " +
+          "Use when the user asks about recent events, needs factual lookups, " +
+          "or wants information beyond your training data.",
+        parameters: Type.Object(
+          {
+            query: Type.String({
+              description: "The search query",
+            }),
+            count: Type.Optional(
+              Type.Number({
+                description: "Number of results to return (default 5, max 10)",
+              }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { query, count: rawCount } = params as { query: string; count?: number };
+          const count = Math.min(Math.max(rawCount ?? 5, 1), 10);
+
+          const braveSecrets = skillSecrets.get("brave-search");
+          const apiKey = braveSecrets?.get("BRAVE_API_KEY");
+
+          if (!apiKey) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Web search is not configured. The BRAVE_API_KEY secret is missing from skill_secrets.",
+                },
+              ],
+              details: { action: "rejected", reason: "missing_secret" },
+            };
+          }
+
+          try {
+            const url = new URL("https://api.search.brave.com/res/v1/web/search");
+            url.searchParams.set("q", query);
+            url.searchParams.set("count", String(count));
+
+            const res = await fetch(url.toString(), {
+              headers: {
+                Accept: "application/json",
+                "X-Subscription-Token": apiKey,
+              },
+            });
+
+            if (!res.ok) {
+              const body = await res.text().catch(() => "");
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Brave Search API error (${res.status}): ${body.slice(0, 200)}`,
+                  },
+                ],
+                details: { action: "error", status: res.status },
+              };
+            }
+
+            const data = (await res.json()) as {
+              web?: {
+                results?: Array<{
+                  title?: string;
+                  url?: string;
+                  description?: string;
+                }>;
+              };
+            };
+
+            const results = data.web?.results ?? [];
+            if (results.length === 0) {
+              return {
+                content: [{ type: "text" as const, text: `No results found for: "${query}"` }],
+                details: { action: "searched", query, count: 0 },
+              };
+            }
+
+            const formatted = results
+              .map(
+                (r, i) =>
+                  `${i + 1}. **${r.title ?? "Untitled"}**\n   ${r.url ?? ""}\n   ${r.description ?? ""}`,
+              )
+              .join("\n\n");
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Search results for "${query}":\n\n${formatted}`,
+                },
+              ],
+              details: { action: "searched", query, count: results.length },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Web search failed: ${String(err)}` }],
+              details: { action: "error", error: String(err) },
+            };
+          }
+        },
+      },
+      { name: "web_search" },
     );
   },
 };
