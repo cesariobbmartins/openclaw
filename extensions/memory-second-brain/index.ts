@@ -3,6 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { getAgentProjects } from "./src/db.js";
 import { loadContext } from "./src/load.js";
 import { flushDailyLog, writeMemoryFile } from "./src/save.js";
+import { listSkills, writeSkill } from "./src/skills.js";
 import type { PluginConfig } from "./src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,8 @@ import type { PluginConfig } from "./src/types.js";
 //   - Daily log: append conversations to daily/YYYY-MM-DD.md
 //   - write_memory tool: LLM writes MEMORY.md/USER.md at workspace root
 //     (where OpenClaw reads and RAG indexes)
+//   - write_skill tool: LLM creates/updates personal skills
+//   - list_skills tool: LLM lists available org + personal skills
 // ---------------------------------------------------------------------------
 
 const memorySecondBrainPlugin = {
@@ -176,6 +179,105 @@ const memorySecondBrainPlugin = {
         },
       },
       { name: "write_memory" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Tool: list_skills — list available org + personal skills
+    // -----------------------------------------------------------------------
+
+    api.registerTool(
+      {
+        name: "list_skills",
+        label: "List Skills",
+        description:
+          "List all available skills (org-level and personal). " +
+          "Shows skill name, description, and tier (org or personal).",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        async execute() {
+          try {
+            const skills = await listSkills(cfg);
+            if (skills.length === 0) {
+              return {
+                content: [{ type: "text" as const, text: "No skills available." }],
+                details: { action: "listed", count: 0 },
+              };
+            }
+
+            const lines = skills.map((s) => `- **${s.name}** [${s.tier}]: ${s.description}`);
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Available skills (${skills.length}):\n\n${lines.join("\n")}`,
+                },
+              ],
+              details: { action: "listed", count: skills.length },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Failed to list skills: ${String(err)}` }],
+              details: { action: "error", error: String(err) },
+            };
+          }
+        },
+      },
+      { name: "list_skills" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Tool: write_skill — create/update personal skill
+    // -----------------------------------------------------------------------
+
+    api.registerTool(
+      {
+        name: "write_skill",
+        label: "Write Skill",
+        description:
+          "Create or update a personal skill. Skills are reusable instructions " +
+          "that teach you how to perform specific tasks. " +
+          "The content must be valid SKILL.md with YAML frontmatter (name + description). " +
+          "Max 50KB per skill, max 10 personal skills.",
+        parameters: Type.Object(
+          {
+            name: Type.String({
+              description:
+                "Skill name: lowercase letters, numbers, and hyphens only (2-64 chars). " +
+                "Example: 'email-template', 'code-review'",
+            }),
+            content: Type.String({
+              description:
+                "Full SKILL.md content including YAML frontmatter with 'name' and 'description'",
+            }),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { name, content } = params as { name: string; content: string };
+
+          try {
+            const result = await writeSkill(cfg, name, content);
+            return {
+              content: [{ type: "text" as const, text: result.message }],
+              details: {
+                action: result.ok ? "written" : "rejected",
+                skillName: name,
+                path: result.path,
+              },
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Failed to write skill "${name}": ${String(err)}`,
+                },
+              ],
+              details: { action: "error", error: String(err) },
+            };
+          }
+        },
+      },
+      { name: "write_skill" },
     );
   },
 };
