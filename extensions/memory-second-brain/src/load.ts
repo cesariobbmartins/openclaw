@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { PluginConfig } from "./types.js";
+import { safePath, type PluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,7 +33,7 @@ function section(title: string, content: string | null): string {
 // ---------------------------------------------------------------------------
 
 async function loadDailyTail(cfg: PluginConfig): Promise<string> {
-  const agentRoot = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId);
+  const agentRoot = safePath(cfg.workspacePath, cfg.org, "agents", cfg.agentId);
   const daily = await readOptionalFile(join(agentRoot, "daily", `${todayIso()}.md`));
   const dailyTail = daily ? tail(daily, cfg.dailyTailLines) : null;
   return section(`Today's Log (${todayIso()})`, dailyTail);
@@ -44,7 +44,7 @@ async function loadDailyTail(cfg: PluginConfig): Promise<string> {
 // ---------------------------------------------------------------------------
 
 async function loadOrg(cfg: PluginConfig): Promise<string> {
-  const base = join(cfg.workspacePath, cfg.org, "org");
+  const base = safePath(cfg.workspacePath, cfg.org, "org");
 
   const [strategy, culture] = await Promise.all([
     readOptionalFile(join(base, "STRATEGY.md")),
@@ -66,7 +66,7 @@ async function loadProjects(cfg: PluginConfig, projectIds: string[]): Promise<st
 
   const contexts = await Promise.all(
     projectIds.map(async (projectId) => {
-      const path = join(cfg.workspacePath, cfg.org, "projects", projectId, "CONTEXT.md");
+      const path = join(safePath(cfg.workspacePath, cfg.org, "projects", projectId), "CONTEXT.md");
       const content = await readOptionalFile(path);
       return content ? section(`Project: ${projectId}`, content) : "";
     }),

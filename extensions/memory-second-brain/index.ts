@@ -101,6 +101,16 @@ const memorySecondBrainPlugin = {
     // (where OpenClaw natively reads and RAG indexes)
     // -----------------------------------------------------------------------
 
+    const MAX_MEMORY_SIZE = 10_000; // 10 KB
+    const MAX_WRITES_PER_SESSION = 3;
+    let writeCount = 0;
+
+    // Reset write counter on each new session
+    api.on("before_agent_start", async () => {
+      writeCount = 0;
+      return undefined;
+    });
+
     api.registerTool(
       {
         name: "write_memory",
@@ -108,7 +118,8 @@ const memorySecondBrainPlugin = {
         description:
           "Persist important information to long-term memory. " +
           "Use target='memory' for facts, decisions, and patterns worth remembering across sessions. " +
-          "Use target='user' to update the user profile with new information.",
+          "Use target='user' to update the user profile with new information. " +
+          "Max 10KB per write, max 3 writes per session.",
         parameters: Type.Object(
           {
             target: Type.Union([Type.Literal("memory"), Type.Literal("user")], {
@@ -122,6 +133,31 @@ const memorySecondBrainPlugin = {
         ),
         async execute(_toolCallId, params) {
           const { target, content } = params as { target: "memory" | "user"; content: string };
+
+          if (content.length > MAX_MEMORY_SIZE) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Content too large (${content.length} chars, max ${MAX_MEMORY_SIZE}). Trim and retry.`,
+                },
+              ],
+              details: { action: "rejected", reason: "size_limit" },
+            };
+          }
+
+          if (++writeCount > MAX_WRITES_PER_SESSION) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Write limit reached (max ${MAX_WRITES_PER_SESSION} per session). Memory not updated.`,
+                },
+              ],
+              details: { action: "rejected", reason: "rate_limit" },
+            };
+          }
+
           try {
             await writeMemoryFile(cfg, target, content);
             const filename = target === "memory" ? "MEMORY.md" : "USER.md";

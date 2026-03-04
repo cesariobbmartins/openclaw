@@ -1,6 +1,6 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { PluginConfig } from "./types.js";
+import { safePath, type PluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -36,10 +36,7 @@ export async function flushDailyLog(cfg: PluginConfig, turns: Turn[]): Promise<v
   if (turns.length === 0) return;
 
   const logPath = join(
-    cfg.workspacePath,
-    cfg.org,
-    "agents",
-    cfg.agentId,
+    safePath(cfg.workspacePath, cfg.org, "agents", cfg.agentId),
     "daily",
     `${todayIso()}.md`,
   );
@@ -65,7 +62,7 @@ export async function writeMemoryFile(
   content: string,
 ): Promise<void> {
   const filename = target === "memory" ? "MEMORY.md" : "USER.md";
-  const path = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId, filename);
+  const path = join(safePath(cfg.workspacePath, cfg.org, "agents", cfg.agentId), filename);
   await ensureDir(path);
   await writeFile(path, content, "utf8");
 }
