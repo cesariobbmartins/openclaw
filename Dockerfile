@@ -32,6 +32,8 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
 
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY --chown=node:node ui/package.json ./ui/package.json
+# Copy extension package.json files so pnpm resolves workspace deps before full COPY
+COPY --chown=node:node extensions/memory-second-brain/package.json ./extensions/memory-second-brain/package.json
 COPY --chown=node:node patches ./patches
 COPY --chown=node:node scripts ./scripts
 
