@@ -111,6 +111,9 @@ async function getGoogleClient(
   if (!clientId || !clientSecret) return null;
 
   const oauth2 = new OAuth2Client(clientId, clientSecret, redirectUri);
+  // Force native fetch — root gaxios may resolve to node-fetch which fails
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (oauth2 as any).transporter.defaults.fetchImplementation = globalThis.fetch;
   oauth2.setCredentials({
     access_token: tokenData.access_token,
     refresh_token: tokenData.refresh_token,
