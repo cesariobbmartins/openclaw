@@ -1,7 +1,6 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { persistSession } from "./db.js";
-import type { PluginConfig, SessionTurn } from "./types.js";
+import type { PluginConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -11,7 +10,13 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
-function formatTurnsAsMarkdown(turns: SessionTurn[]): string {
+interface Turn {
+  role: string;
+  content: string;
+  timestamp: string;
+}
+
+function formatTurnsAsMarkdown(turns: Turn[]): string {
   const lines = turns.map((t) => {
     const prefix = t.role === "user" ? "**User**" : "**Assistant**";
     return `${prefix} (${t.timestamp})\n\n${t.content}\n`;
@@ -24,10 +29,10 @@ async function ensureDir(path: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Flush daily log (append conversation to GCS FUSE)
+// Flush daily log (append conversation to GCS FUSE — workspace root)
 // ---------------------------------------------------------------------------
 
-export async function flushDailyLog(cfg: PluginConfig, turns: SessionTurn[]): Promise<void> {
+export async function flushDailyLog(cfg: PluginConfig, turns: Turn[]): Promise<void> {
   if (turns.length === 0) return;
 
   const logPath = join(
@@ -35,7 +40,6 @@ export async function flushDailyLog(cfg: PluginConfig, turns: SessionTurn[]): Pr
     cfg.org,
     "agents",
     cfg.agentId,
-    "memory",
     "daily",
     `${todayIso()}.md`,
   );
@@ -49,7 +53,8 @@ export async function flushDailyLog(cfg: PluginConfig, turns: SessionTurn[]): Pr
 }
 
 // ---------------------------------------------------------------------------
-// Write memory file (used by write_memory tool)
+// Write memory file (used by write_memory tool — writes to workspace root
+// where OpenClaw natively reads and RAG indexes)
 // ---------------------------------------------------------------------------
 
 type MemoryTarget = "memory" | "user";
@@ -60,19 +65,7 @@ export async function writeMemoryFile(
   content: string,
 ): Promise<void> {
   const filename = target === "memory" ? "MEMORY.md" : "USER.md";
-  const path = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId, "memory", filename);
+  const path = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId, filename);
   await ensureDir(path);
   await writeFile(path, content, "utf8");
-}
-
-// ---------------------------------------------------------------------------
-// Full session flush: daily log + Supabase
-// ---------------------------------------------------------------------------
-
-export async function flushSession(
-  cfg: PluginConfig,
-  sessionId: string,
-  turns: SessionTurn[],
-): Promise<void> {
-  await Promise.allSettled([flushDailyLog(cfg, turns), persistSession(cfg, sessionId, turns)]);
 }

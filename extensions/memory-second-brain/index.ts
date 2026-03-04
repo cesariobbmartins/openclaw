@@ -1,76 +1,55 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { getAgentProjects, loadRecentSession } from "./src/db.js";
+import { getAgentProjects } from "./src/db.js";
 import { loadContext } from "./src/load.js";
-import { flushSession, writeMemoryFile } from "./src/save.js";
-import type { PluginConfig, SessionTurn } from "./src/types.js";
+import { flushDailyLog, writeMemoryFile } from "./src/save.js";
+import type { PluginConfig } from "./src/types.js";
 
 // ---------------------------------------------------------------------------
-// In-memory session buffer (turns accumulate here during the conversation)
-// ---------------------------------------------------------------------------
-
-let sessionTurns: SessionTurn[] = [];
-let resolvedCfg: PluginConfig | null = null;
-let resolvedSessionId: string | null = null;
-
-// ---------------------------------------------------------------------------
-// Plugin
+// Plugin — extends OpenClaw native memory with org, project, and daily log
+//
+// What OpenClaw handles natively (we don't touch):
+//   - SOUL.md, USER.md, MEMORY.md, IDENTITY.md reading + system prompt injection
+//   - RAG via memory_search / memory_get
+//   - Session persistence via JSONL on disk
+//
+// What this plugin adds:
+//   - Org context: STRATEGY.md, CULTURE.md
+//   - Project context: CONTEXT.md per project membership
+//   - Daily log: append conversations to daily/YYYY-MM-DD.md
+//   - write_memory tool: LLM writes MEMORY.md/USER.md at workspace root
+//     (where OpenClaw reads and RAG indexes)
 // ---------------------------------------------------------------------------
 
 const memorySecondBrainPlugin = {
   id: "memory-second-brain",
   name: "Memory (Second Brain)",
-  description: "Three-space memory over GCS FUSE: private, org, and projects",
+  description: "Extends OpenClaw with org context, project context, daily log, and write_memory",
   kind: "memory" as const,
 
   register(api: OpenClawPluginApi) {
-    // Resolve and validate config from openclaw.plugin.json configSchema
     const raw = api.pluginConfig as Record<string, unknown>;
     const cfg: PluginConfig = {
       org: raw.org as string,
       agentId: raw.agentId as string,
       workspacePath: (raw.workspacePath as string | undefined) ?? "/workspaces",
-      supabaseUrl: raw.supabaseUrl as string | undefined,
-      supabaseKey: raw.supabaseKey as string | undefined,
+      databaseUrl: raw.databaseUrl as string | undefined,
       dailyTailLines: (raw.dailyTailLines as number | undefined) ?? 100,
     };
-    resolvedCfg = cfg;
 
-    api.logger.info(
-      `[memory-second-brain] initialized — org=${cfg.org} agent=${cfg.agentId} workspace=${cfg.workspacePath}`,
-    );
+    api.logger.info(`[memory-second-brain] initialized — org=${cfg.org} agent=${cfg.agentId}`);
 
     // -----------------------------------------------------------------------
-    // Hook: before_agent_start — load full memory context + session recovery
+    // Hook: before_agent_start — inject org + project context + daily tail
     // -----------------------------------------------------------------------
 
-    api.on("before_agent_start", async (event) => {
-      // session key is the phone number (WhatsApp) or user identifier
-      const sessionId =
-        (event as { sessionKey?: string }).sessionKey ?? `${cfg.org}/${cfg.agentId}`;
-      resolvedSessionId = sessionId;
-
+    api.on("before_agent_start", async () => {
       try {
-        // Load project membership from Supabase
         const projectIds = await getAgentProjects(cfg);
+        const extensionContext = await loadContext(cfg, projectIds);
 
-        // Load all memory files from GCS FUSE
-        const memoryContext = await loadContext(cfg, projectIds);
-
-        // Session recovery: if container restarted recently, reload prior turns
-        const priorTurns = await loadRecentSession(cfg, sessionId, 30);
-        if (priorTurns.length > 0) {
-          sessionTurns = priorTurns;
-          api.logger.info(
-            `[memory-second-brain] recovered ${priorTurns.length} turns from Supabase`,
-          );
-        } else {
-          sessionTurns = [];
-        }
-
-        if (!memoryContext) return undefined;
-
-        return { prependContext: memoryContext };
+        if (!extensionContext) return undefined;
+        return { prependContext: extensionContext };
       } catch (err) {
         api.logger.warn(`[memory-second-brain] load failed: ${String(err)}`);
         return undefined;
@@ -78,14 +57,14 @@ const memorySecondBrainPlugin = {
     });
 
     // -----------------------------------------------------------------------
-    // Hook: agent_end — collect turns + flush to GCS + Supabase
+    // Hook: agent_end — append conversation to daily log
     // -----------------------------------------------------------------------
 
     api.on("agent_end", async (event) => {
       if (!event.success || !event.messages || event.messages.length === 0) return;
 
-      // Extract user + assistant turns from this conversation
-      const newTurns: SessionTurn[] = [];
+      const turns: Array<{ role: string; content: string; timestamp: string }> = [];
+
       for (const msg of event.messages) {
         if (!msg || typeof msg !== "object") continue;
         const m = msg as Record<string, unknown>;
@@ -103,25 +82,23 @@ const memorySecondBrainPlugin = {
         }
 
         if (content.trim()) {
-          newTurns.push({
-            role: role as "user" | "assistant",
+          turns.push({
+            role,
             content: content.trim(),
             timestamp: new Date().toISOString(),
           });
         }
       }
 
-      sessionTurns = [...sessionTurns, ...newTurns];
-
-      // Fire-and-forget flush — don't block agent response
-      const sessionId = resolvedSessionId ?? `${cfg.org}/${cfg.agentId}`;
-      flushSession(cfg, sessionId, sessionTurns).catch((err) => {
-        api.logger.warn(`[memory-second-brain] flush failed: ${String(err)}`);
+      // Fire-and-forget — don't block agent response
+      flushDailyLog(cfg, turns).catch((err) => {
+        api.logger.warn(`[memory-second-brain] daily log flush failed: ${String(err)}`);
       });
     });
 
     // -----------------------------------------------------------------------
-    // Tool: write_memory — LLM calls this to update MEMORY.md or USER.md
+    // Tool: write_memory — LLM writes MEMORY.md or USER.md at workspace root
+    // (where OpenClaw natively reads and RAG indexes)
     // -----------------------------------------------------------------------
 
     api.registerTool(
@@ -164,25 +141,6 @@ const memorySecondBrainPlugin = {
       },
       { name: "write_memory" },
     );
-
-    // -----------------------------------------------------------------------
-    // Graceful shutdown: flush session before container dies
-    // -----------------------------------------------------------------------
-
-    api.registerService({
-      id: "memory-second-brain",
-      start: () => {
-        process.on("SIGTERM", () => {
-          if (!resolvedCfg || sessionTurns.length === 0) return;
-          const sessionId = resolvedSessionId ?? `${resolvedCfg.org}/${resolvedCfg.agentId}`;
-          flushSession(resolvedCfg, sessionId, sessionTurns).catch(() => {});
-        });
-        api.logger.info("[memory-second-brain] service started");
-      },
-      stop: () => {
-        api.logger.info("[memory-second-brain] service stopped");
-      },
-    });
   },
 };
 

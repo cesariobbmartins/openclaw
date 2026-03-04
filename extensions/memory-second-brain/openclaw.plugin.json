@@ -19,13 +19,9 @@
         "description": "GCS FUSE mount point or local dev path",
         "default": "/workspaces"
       },
-      "supabaseUrl": {
+      "databaseUrl": {
         "type": "string",
-        "description": "Supabase project URL (or ${SUPABASE_URL})"
-      },
-      "supabaseKey": {
-        "type": "string",
-        "description": "Supabase service role key (or ${SUPABASE_KEY})"
+        "description": "Postgres connection string for project membership queries (or ${DATABASE_URL})"
       },
       "dailyTailLines": {
         "type": "number",

@@ -29,27 +29,14 @@ function section(title: string, content: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// Load private memory space
+// Load today's daily log tail (from workspace root, alongside SOUL.md etc.)
 // ---------------------------------------------------------------------------
 
-async function loadPrivate(cfg: PluginConfig): Promise<string> {
-  const base = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId, "memory");
-
-  const [soul, user, memory, daily] = await Promise.all([
-    readOptionalFile(join(base, "SOUL.md")),
-    readOptionalFile(join(base, "USER.md")),
-    readOptionalFile(join(base, "MEMORY.md")),
-    readOptionalFile(join(base, "daily", `${todayIso()}.md`)),
-  ]);
-
+async function loadDailyTail(cfg: PluginConfig): Promise<string> {
+  const agentRoot = join(cfg.workspacePath, cfg.org, "agents", cfg.agentId);
+  const daily = await readOptionalFile(join(agentRoot, "daily", `${todayIso()}.md`));
   const dailyTail = daily ? tail(daily, cfg.dailyTailLines) : null;
-
-  return [
-    section("Identity (SOUL)", soul),
-    section("User Profile (USER)", user),
-    section("Long-term Memory (MEMORY)", memory),
-    section(`Today's Log (${todayIso()})`, dailyTail),
-  ].join("");
+  return section(`Today's Log (${todayIso()})`, dailyTail);
 }
 
 // ---------------------------------------------------------------------------
@@ -89,18 +76,18 @@ async function loadProjects(cfg: PluginConfig, projectIds: string[]): Promise<st
 }
 
 // ---------------------------------------------------------------------------
-// Main export
+// Main export — only loads what OpenClaw doesn't handle natively
 // ---------------------------------------------------------------------------
 
 export async function loadContext(cfg: PluginConfig, projectIds: string[]): Promise<string> {
-  const [privateCtx, orgCtx, projectsCtx] = await Promise.all([
-    loadPrivate(cfg),
+  const [dailyCtx, orgCtx, projectsCtx] = await Promise.all([
+    loadDailyTail(cfg),
     loadOrg(cfg),
     loadProjects(cfg, projectIds),
   ]);
 
-  const parts = [privateCtx, orgCtx, projectsCtx].filter(Boolean);
+  const parts = [dailyCtx, orgCtx, projectsCtx].filter(Boolean);
   if (parts.length === 0) return "";
 
-  return `<!-- Second Brain Memory Context -->\n${parts.join("")}\n<!-- End Memory Context -->`;
+  return `<!-- Second Brain Extension Context -->\n${parts.join("")}\n<!-- End Extension Context -->`;
 }
