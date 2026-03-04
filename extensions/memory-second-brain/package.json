@@ -6,6 +6,7 @@
   "type": "module",
   "dependencies": {
     "@sinclair/typebox": "^0.34.48",
+    "googleapis": "^171.4.0",
     "pg": "^8.19.0"
   },
   "devDependencies": {

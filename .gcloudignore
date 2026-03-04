@@ -15,7 +15,16 @@
 # pnpm lockfile is committed — must not be excluded by #!include:.gitignore
 !pnpm-lock.yaml
 
-docs/
+# Exclude docs/ contents but keep the directory so we can re-include templates.
+# gitignore rule: a parent dir excluded with trailing / blocks all negations on children;
+# using /* instead excludes contents while allowing child negations.
+docs/*
+!docs/reference/
+docs/reference/*
+!docs/reference/templates/
+# .gitignore has global IDENTITY.md and USER.md rules (workspace files);
+# override them for the bundled templates.
+!docs/reference/templates/*
 scripts/docker/
 scripts/e2e/
 .git/

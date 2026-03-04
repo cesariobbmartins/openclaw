@@ -1,6 +1,16 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { getAgentProjects, getSkillSecrets } from "./src/db.js";
+import { getAgentCredential, deleteAgentCredential } from "./src/db.js";
+import {
+  generateGoogleAuthUrl,
+  gmailSearch,
+  gmailRead,
+  calendarList,
+  calendarCreate,
+  driveSearch,
+  driveRead,
+} from "./src/google.js";
 import { loadContext } from "./src/load.js";
 import { flushDailyLog, writeMemoryFile } from "./src/save.js";
 import { listSkills, writeSkill } from "./src/skills.js";
@@ -23,6 +33,8 @@ import type { PluginConfig } from "./src/types.js";
 //   - write_skill tool: LLM creates/updates personal skills
 //   - list_skills tool: LLM lists available org + personal skills
 //   - web_search tool: search the web via Brave Search (key from skill_secrets)
+//   - Google tools: connect_google, gmail_search, gmail_read,
+//     calendar_list, calendar_create, drive_search, drive_read
 // ---------------------------------------------------------------------------
 
 const memorySecondBrainPlugin = {
@@ -406,6 +418,419 @@ const memorySecondBrainPlugin = {
         },
       },
       { name: "web_search" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Google Workspace tools — per-user OAuth tokens from agent_credentials
+    // -----------------------------------------------------------------------
+
+    const googleNotConnected = {
+      content: [
+        {
+          type: "text" as const,
+          text: "Google não está conectado. Peça ao usuário para conectar usando connect_google.",
+        },
+      ],
+      details: { action: "rejected" as const, reason: "not_connected" },
+    };
+
+    function googleError(err: unknown) {
+      const msg = String(err);
+      // Token revoked or invalid
+      if (msg.includes("invalid_grant") || msg.includes("Token has been expired or revoked")) {
+        deleteAgentCredential(cfg, "google").catch(() => {});
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Acesso ao Google foi revogado. Peça ao usuário para reconectar usando connect_google.",
+            },
+          ],
+          details: { action: "error" as const, reason: "token_revoked" },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Google API error: ${msg}` }],
+        details: { action: "error" as const, error: msg },
+      };
+    }
+
+    // Tool: connect_google
+
+    api.registerTool(
+      {
+        name: "connect_google",
+        label: "Connect Google",
+        description:
+          "Connect the user's Google account (Gmail, Calendar, Drive). " +
+          "Generates an authorization link for the user to click. " +
+          "Use when the user wants to access their emails, calendar, or Drive files.",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        async execute() {
+          // Check if already connected
+          const existing = await getAgentCredential(cfg, "google");
+          if (existing) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Google já está conectado! Você pode usar gmail_search, calendar_list e drive_search.",
+                },
+              ],
+              details: { action: "already_connected" },
+            };
+          }
+
+          const url = generateGoogleAuthUrl(cfg);
+          if (!url) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Google OAuth não está configurado. Entre em contato com o administrador.",
+                },
+              ],
+              details: { action: "rejected", reason: "not_configured" },
+            };
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Para conectar sua conta Google, clique no link abaixo:\n\n${url}\n\nApós autorizar, volte aqui e peça o que precisar (emails, agenda, documentos).`,
+              },
+            ],
+            details: { action: "auth_url_generated" },
+          };
+        },
+      },
+      { name: "connect_google" },
+    );
+
+    // Tool: gmail_search
+
+    api.registerTool(
+      {
+        name: "gmail_search",
+        label: "Gmail Search",
+        description:
+          "Search emails in the user's Gmail. " +
+          "Supports Gmail search operators (from:, subject:, after:, before:, is:unread, etc.).",
+        parameters: Type.Object(
+          {
+            query: Type.String({
+              description: "Gmail search query (e.g. 'from:boss@company.com is:unread')",
+            }),
+            maxResults: Type.Optional(
+              Type.Number({ description: "Max results (default 5, max 20)" }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { query, maxResults: rawMax } = params as { query: string; maxResults?: number };
+          const max = Math.min(Math.max(rawMax ?? 5, 1), 20);
+
+          try {
+            const results = await gmailSearch(cfg, query, max);
+            if (!results) return googleNotConnected;
+            if (results.length === 0) {
+              return {
+                content: [
+                  { type: "text" as const, text: `Nenhum email encontrado para: "${query}"` },
+                ],
+                details: { action: "searched", query, count: 0 },
+              };
+            }
+
+            const formatted = results
+              .map(
+                (e) =>
+                  `- **${e.subject}**\n  De: ${e.from} | ${e.date}\n  ${e.snippet}\n  [ID: ${e.id}]`,
+              )
+              .join("\n\n");
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Emails encontrados (${results.length}):\n\n${formatted}`,
+                },
+              ],
+              details: { action: "searched", query, count: results.length },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "gmail_search" },
+    );
+
+    // Tool: gmail_read
+
+    api.registerTool(
+      {
+        name: "gmail_read",
+        label: "Gmail Read",
+        description:
+          "Read the full content of a specific email by its message ID (from gmail_search results).",
+        parameters: Type.Object(
+          {
+            messageId: Type.String({
+              description: "The email message ID (from gmail_search results)",
+            }),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { messageId } = params as { messageId: string };
+
+          try {
+            const email = await gmailRead(cfg, messageId);
+            if (!email) return googleNotConnected;
+
+            const text = [
+              `**${email.subject}**`,
+              `De: ${email.from}`,
+              `Para: ${email.to}`,
+              `Data: ${email.date}`,
+              "",
+              email.body,
+            ].join("\n");
+
+            return {
+              content: [{ type: "text" as const, text }],
+              details: { action: "read", messageId },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "gmail_read" },
+    );
+
+    // Tool: calendar_list
+
+    api.registerTool(
+      {
+        name: "calendar_list",
+        label: "Calendar List",
+        description:
+          "List upcoming calendar events. " +
+          "Defaults to the next 7 days if no dates are specified.",
+        parameters: Type.Object(
+          {
+            timeMin: Type.Optional(
+              Type.String({
+                description: "Start date/time (ISO 8601, e.g. '2026-03-05T00:00:00Z')",
+              }),
+            ),
+            timeMax: Type.Optional(Type.String({ description: "End date/time (ISO 8601)" })),
+            maxResults: Type.Optional(
+              Type.Number({ description: "Max events (default 10, max 50)" }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const {
+            timeMin: rawMin,
+            timeMax: rawMax,
+            maxResults: rawCount,
+          } = params as {
+            timeMin?: string;
+            timeMax?: string;
+            maxResults?: number;
+          };
+
+          const now = new Date();
+          const timeMin = rawMin ?? now.toISOString();
+          const timeMax = rawMax ?? new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+          const maxResults = Math.min(Math.max(rawCount ?? 10, 1), 50);
+
+          try {
+            const events = await calendarList(cfg, timeMin, timeMax, maxResults);
+            if (!events) return googleNotConnected;
+            if (events.length === 0) {
+              return {
+                content: [{ type: "text" as const, text: "Nenhum evento encontrado no período." }],
+                details: { action: "listed", count: 0 },
+              };
+            }
+
+            const formatted = events
+              .map((e) => {
+                let line = `- **${e.summary}**\n  ${e.start} → ${e.end}`;
+                if (e.location) line += `\n  Local: ${e.location}`;
+                if (e.attendees?.length) line += `\n  Participantes: ${e.attendees.join(", ")}`;
+                return line;
+              })
+              .join("\n\n");
+
+            return {
+              content: [
+                { type: "text" as const, text: `Eventos (${events.length}):\n\n${formatted}` },
+              ],
+              details: { action: "listed", count: events.length },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "calendar_list" },
+    );
+
+    // Tool: calendar_create
+
+    api.registerTool(
+      {
+        name: "calendar_create",
+        label: "Calendar Create",
+        description: "Create a new calendar event.",
+        parameters: Type.Object(
+          {
+            summary: Type.String({ description: "Event title" }),
+            start: Type.String({
+              description: "Start date/time (ISO 8601, e.g. '2026-03-05T14:00:00-03:00')",
+            }),
+            end: Type.String({ description: "End date/time (ISO 8601)" }),
+            description: Type.Optional(Type.String({ description: "Event description" })),
+            location: Type.Optional(Type.String({ description: "Event location" })),
+            attendees: Type.Optional(
+              Type.Array(Type.String(), { description: "Email addresses of attendees" }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const p = params as {
+            summary: string;
+            start: string;
+            end: string;
+            description?: string;
+            location?: string;
+            attendees?: string[];
+          };
+
+          try {
+            const event = await calendarCreate(cfg, p);
+            if (!event) return googleNotConnected;
+
+            let text = `Evento criado: **${event.summary}**\n${event.start} → ${event.end}`;
+            if (event.htmlLink) text += `\n\n${event.htmlLink}`;
+
+            return {
+              content: [{ type: "text" as const, text }],
+              details: { action: "created", eventId: event.id },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "calendar_create" },
+    );
+
+    // Tool: drive_search
+
+    api.registerTool(
+      {
+        name: "drive_search",
+        label: "Drive Search",
+        description: "Search for files in the user's Google Drive.",
+        parameters: Type.Object(
+          {
+            query: Type.String({ description: "Search query (file name or content)" }),
+            maxResults: Type.Optional(
+              Type.Number({ description: "Max results (default 10, max 30)" }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { query, maxResults: rawMax } = params as { query: string; maxResults?: number };
+          const max = Math.min(Math.max(rawMax ?? 10, 1), 30);
+
+          try {
+            const files = await driveSearch(cfg, query, max);
+            if (!files) return googleNotConnected;
+            if (files.length === 0) {
+              return {
+                content: [
+                  { type: "text" as const, text: `Nenhum arquivo encontrado para: "${query}"` },
+                ],
+                details: { action: "searched", query, count: 0 },
+              };
+            }
+
+            const formatted = files
+              .map((f) => {
+                let line = `- **${f.name}** [${f.mimeType}]`;
+                if (f.modifiedTime) line += ` (${f.modifiedTime})`;
+                if (f.webViewLink) line += `\n  ${f.webViewLink}`;
+                line += `\n  [ID: ${f.id}]`;
+                return line;
+              })
+              .join("\n\n");
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Arquivos encontrados (${files.length}):\n\n${formatted}`,
+                },
+              ],
+              details: { action: "searched", query, count: files.length },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "drive_search" },
+    );
+
+    // Tool: drive_read
+
+    api.registerTool(
+      {
+        name: "drive_read",
+        label: "Drive Read",
+        description:
+          "Read the content of a file from Google Drive. " +
+          "Supports Google Docs (text), Sheets (CSV), Slides (text), and plain text files.",
+        parameters: Type.Object(
+          {
+            fileId: Type.String({ description: "The file ID (from drive_search results)" }),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const { fileId } = params as { fileId: string };
+
+          try {
+            const result = await driveRead(cfg, fileId);
+            if (!result) return googleNotConnected;
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `**${result.name}**\n\n${result.content}`,
+                },
+              ],
+              details: { action: "read", fileId, fileName: result.name },
+            };
+          } catch (err) {
+            return googleError(err);
+          }
+        },
+      },
+      { name: "drive_read" },
     );
   },
 };

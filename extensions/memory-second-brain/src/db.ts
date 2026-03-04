@@ -71,3 +71,61 @@ export async function getSkillSecrets(
     return new Map();
   }
 }
+
+// ---------------------------------------------------------------------------
+// Agent credentials (per-agent OAuth tokens)
+// ---------------------------------------------------------------------------
+
+export interface AgentCredentialRow {
+  token_data: string; // AES-256-GCM encrypted JSON
+  scopes: string[];
+  expires_at: Date | null;
+}
+
+export async function getAgentCredential(
+  cfg: PluginConfig,
+  provider: string,
+): Promise<AgentCredentialRow | null> {
+  const db = getPool(cfg);
+  if (!db) return null;
+
+  try {
+    const { rows } = await db.query<AgentCredentialRow>(
+      "SELECT token_data, scopes, expires_at FROM agent_credentials WHERE org_id = $1 AND agent_id = $2 AND provider = $3",
+      [cfg.org, cfg.agentId, provider],
+    );
+    return rows[0] ?? null;
+  } catch (err) {
+    console.warn("[memory-second-brain] failed to load agent credential:", String(err));
+    return null;
+  }
+}
+
+export async function saveAgentCredential(
+  cfg: PluginConfig,
+  provider: string,
+  tokenData: string,
+  scopes: string[],
+  expiresAt: Date | null,
+): Promise<void> {
+  const db = getPool(cfg);
+  if (!db) return;
+
+  await db.query(
+    `INSERT INTO agent_credentials (org_id, agent_id, provider, token_data, scopes, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (org_id, agent_id, provider)
+     DO UPDATE SET token_data = $4, scopes = $5, expires_at = $6, updated_at = NOW()`,
+    [cfg.org, cfg.agentId, provider, tokenData, scopes, expiresAt],
+  );
+}
+
+export async function deleteAgentCredential(cfg: PluginConfig, provider: string): Promise<void> {
+  const db = getPool(cfg);
+  if (!db) return;
+
+  await db.query(
+    "DELETE FROM agent_credentials WHERE org_id = $1 AND agent_id = $2 AND provider = $3",
+    [cfg.org, cfg.agentId, provider],
+  );
+}
