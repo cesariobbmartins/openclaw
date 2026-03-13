@@ -11,8 +11,12 @@ substitutions:
 
 steps:
   - name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
     args:
       - build
+      - --build-arg
+      - OPENCLAW_EXTENSIONS=memory-second-brain
       - --build-arg
       - OPENCLAW_INSTALL_BROWSER=1
       - --build-arg
