@@ -1,0 +1,27 @@
+{
+  "id": "memory-second-brain",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["org", "agentId"],
+    "properties": {
+      "org": {
+        "type": "string",
+        "description": "Organization ID (e.g. 'zoop')"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Agent ID (e.g. 'cesario')"
+      },
+      "workspacePath": {
+        "type": "string",
+        "description": "GCS FUSE mount point or local dev path",
+        "default": "/workspaces"
+      },
+      "databaseUrl": {
+        "type": "string",
+        "description": "Postgres connection string for project membership queries (or ${DATABASE_URL})"
+      }
+    }
+  }
+}

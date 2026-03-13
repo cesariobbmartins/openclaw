@@ -1,0 +1,30 @@
+# Cloud Build source upload rules.
+# Skip large dirs irrelevant to the Docker build.
+.gcloudignore
+#!include:.gitignore
+
+# Re-include git-tracked a2ui sources.
+# vendor/ is listed in .gitignore (force-added files), so we must negate
+# at every level after #!include:.gitignore for the override to take effect.
+!vendor/
+!vendor/a2ui/
+!vendor/a2ui/renderers/
+!vendor/a2ui/renderers/lit/
+!vendor/a2ui/renderers/lit/**
+
+# pnpm lockfile is committed — must not be excluded by #!include:.gitignore
+!pnpm-lock.yaml
+
+# Exclude docs/ contents but keep the directory so we can re-include templates.
+# gitignore rule: a parent dir excluded with trailing / blocks all negations on children;
+# using /* instead excludes contents while allowing child negations.
+docs/*
+!docs/reference/
+docs/reference/*
+!docs/reference/templates/
+# .gitignore has global IDENTITY.md and USER.md rules (workspace files);
+# override them for the bundled templates.
+!docs/reference/templates/*
+scripts/docker/
+scripts/e2e/
+.git/

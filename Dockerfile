@@ -220,6 +220,23 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
         docker-ce-cli docker-compose-plugin; \
     fi
 
+# Optionally install QMD binary for memory search (BM25 + vector + reranking).
+# Build with: docker build --build-arg OPENCLAW_INSTALL_QMD=1 ...
+# The @tobilu/qmd npm package bundles a platform-native Rust binary (~30MB).
+ARG OPENCLAW_INSTALL_QMD=""
+RUN if [ -n "$OPENCLAW_INSTALL_QMD" ]; then \
+      npm install -g @tobilu/qmd && \
+      echo "QMD installed: $(qmd --version 2>/dev/null || echo 'version unknown')"; \
+    fi
+
+# Optionally install Google Workspace CLI for agent Workspace integration.
+# Build with: docker build --build-arg OPENCLAW_INSTALL_GWS=1 ...
+ARG OPENCLAW_INSTALL_GWS=""
+RUN if [ -n "$OPENCLAW_INSTALL_GWS" ]; then \
+      npm install -g @googleworkspace/cli && \
+      echo "GWS CLI installed"; \
+    fi
+
 # Expose the CLI binary without requiring npm global writes as non-root.
 RUN ln -sf /app/openclaw.mjs /usr/local/bin/openclaw \
  && chmod 755 /app/openclaw.mjs

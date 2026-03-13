@@ -1,0 +1,21 @@
+{
+  "name": "@second-brain/memory-second-brain",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Second Brain Enterprise memory extension — org context, project context, daily log, write_memory",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.48",
+    "google-auth-library": "^10.6.1",
+    "googleapis": "^171.4.0",
+    "pg": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.18.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

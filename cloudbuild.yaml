@@ -1,0 +1,32 @@
+# Cloud Build config for the OpenClaw fork base image
+#
+# Usage (called by scripts/build-agent-image.ts in second-brain-enterprise):
+#   gcloud builds submit . \
+#     --config=cloudbuild.yaml \
+#     --substitutions=_BASE_IMAGE=<registry>/openclaw-sb:latest \
+#     --project=<project> --region=<region>
+
+substitutions:
+  _BASE_IMAGE: ""
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - --build-arg
+      - OPENCLAW_INSTALL_BROWSER=1
+      - --build-arg
+      - OPENCLAW_INSTALL_QMD=1
+      - --build-arg
+      - OPENCLAW_INSTALL_GWS=1
+      - -t
+      - ${_BASE_IMAGE}
+      - .
+
+images:
+  - ${_BASE_IMAGE}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # High-CPU machine to speed up pnpm install + build
+  machineType: "E2_HIGHCPU_8"
