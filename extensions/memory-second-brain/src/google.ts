@@ -55,15 +55,14 @@ export interface DriveFile {
 // ---------------------------------------------------------------------------
 
 const GOOGLE_SCOPES = [
-  "https://www.googleapis.com/auth/gmail.modify", // read + send/reply/forward
-  "https://www.googleapis.com/auth/calendar", // full calendar access
-  "https://www.googleapis.com/auth/drive", // full drive access (upload, create)
-  "https://www.googleapis.com/auth/documents", // Google Docs create/edit
-  "https://www.googleapis.com/auth/spreadsheets", // Google Sheets read/write
-  "https://www.googleapis.com/auth/tasks", // Google Tasks
-  "https://www.googleapis.com/auth/chat.messages", // Google Chat send
-  "https://www.googleapis.com/auth/contacts.readonly", // People/Contacts
-  "https://www.googleapis.com/auth/meetings.space.readonly", // Meet transcripts
+  "https://www.googleapis.com/auth/gmail.readonly", // read-only
+  "https://www.googleapis.com/auth/calendar", // read + write (create events)
+  "https://www.googleapis.com/auth/drive.readonly", // read-only
+  "https://www.googleapis.com/auth/documents.readonly", // read-only
+  "https://www.googleapis.com/auth/spreadsheets.readonly", // read-only
+  "https://www.googleapis.com/auth/tasks.readonly", // read-only
+  "https://www.googleapis.com/auth/contacts.readonly", // read-only
+  "https://www.googleapis.com/auth/meetings.space.readonly", // read-only
 ];
 
 // ---------------------------------------------------------------------------
