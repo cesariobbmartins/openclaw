@@ -3,7 +3,7 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["org", "agentId"],
+    "required": ["org"],
     "properties": {
       "org": {
         "type": "string",
