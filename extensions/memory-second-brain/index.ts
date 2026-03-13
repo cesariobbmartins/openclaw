@@ -4,7 +4,6 @@ import { getAgentProjects, getSkillSecrets } from "./src/db.js";
 import { getAgentCredential, deleteAgentCredential } from "./src/db.js";
 import {
   generateGoogleAuthUrl,
-  getGoogleAccessToken,
   gmailSearch,
   gmailRead,
   calendarList,
@@ -20,14 +19,13 @@ import type { PluginConfig } from "./src/types.js";
 // ---------------------------------------------------------------------------
 // Plugin — enterprise extensions for Second Brain agents
 //
+// Multi-agent aware: tools use OpenClawPluginToolFactory pattern so agentId
+// is resolved at runtime from the request context (not static config).
+// This allows a single OpenClaw process to serve multiple agents.
+//
 // What OpenClaw handles natively (we don't touch):
 //   - SOUL.md, USER.md, MEMORY.md, IDENTITY.md reading + system prompt injection
 //   - Session persistence via JSONL on disk (serves as audit trail)
-//
-// What memory-lancedb-pro handles (memory slot plugin):
-//   - RAG via hybrid retrieval (vector + BM25)
-//   - Auto-extract memories from conversations
-//   - Auto-recall relevant memories before each turn
 //
 // What this plugin adds:
 //   - Org context: STRATEGY.md, CULTURE.md
@@ -50,20 +48,108 @@ const memorySecondBrainPlugin = {
 
   register(api: OpenClawPluginApi) {
     const raw = api.pluginConfig as Record<string, unknown>;
-    const cfg: PluginConfig = {
+
+    // Base config from static plugin config. agentId is optional here —
+    // in multi-agent mode it comes from runtime context instead.
+    const baseCfg = {
       org: raw.org as string,
-      agentId: raw.agentId as string,
+      agentId: (raw.agentId as string | undefined) ?? "",
       workspacePath: (raw.workspacePath as string | undefined) ?? "/workspaces",
       databaseUrl: raw.databaseUrl as string | undefined,
     };
 
-    api.logger.info(`[memory-second-brain] initialized — org=${cfg.org} agent=${cfg.agentId}`);
+    api.logger.info(
+      `[memory-second-brain] initialized — org=${baseCfg.org} agent=${baseCfg.agentId || "(multi-agent)"}`,
+    );
+
+    // -----------------------------------------------------------------------
+    // Helpers: build PluginConfig from runtime context
+    // -----------------------------------------------------------------------
+
+    function cfgFromCtx(ctx: { agentId?: string }): PluginConfig {
+      const agentId = ctx.agentId ?? baseCfg.agentId;
+      if (!agentId) {
+        throw new Error(
+          "[memory-second-brain] SECURITY: agentId is empty. " +
+            "In multi-agent mode, ctx.agentId must be set by the request handler.",
+        );
+      }
+      return {
+        org: baseCfg.org,
+        agentId,
+        workspacePath: baseCfg.workspacePath,
+        databaseUrl: baseCfg.databaseUrl,
+      };
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-agent state (Maps keyed by agentId for multi-agent isolation)
+    // -----------------------------------------------------------------------
+
+    const writeCountMap = new Map<string, number>();
+    const skillSecretsMap = new Map<string, Map<string, Map<string, string>>>();
+    const skillSecretsLoaded = new Set<string>();
+
+    const MAX_USER_SIZE = 10_000; // 10 KB
+    const MAX_WRITES_PER_SESSION = 3;
+    const MAX_BROWSE_CONTENT = 12_000;
+
+    async function ensureSkillSecrets(
+      cfg: PluginConfig,
+    ): Promise<Map<string, Map<string, string>>> {
+      const key = cfg.agentId;
+      if (!skillSecretsLoaded.has(key)) {
+        try {
+          const secrets = await getSkillSecrets(cfg);
+          skillSecretsMap.set(key, secrets);
+          skillSecretsLoaded.add(key);
+        } catch (err) {
+          api.logger.warn(`[memory-second-brain] skill secrets (${key}): ${String(err)}`);
+        }
+      }
+      return skillSecretsMap.get(key) ?? new Map();
+    }
+
+    // -----------------------------------------------------------------------
+    // Google helpers
+    // -----------------------------------------------------------------------
+
+    const googleNotConnected = {
+      content: [
+        {
+          type: "text" as const,
+          text: "Google não está conectado. Peça ao usuário para conectar usando connect_google.",
+        },
+      ],
+      details: { action: "rejected" as const, reason: "not_connected" },
+    };
+
+    function googleError(cfg: PluginConfig, err: unknown) {
+      const msg = String(err);
+      if (msg.includes("invalid_grant") || msg.includes("Token has been expired or revoked")) {
+        deleteAgentCredential(cfg, "google").catch(() => {});
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Acesso ao Google foi revogado. Peça ao usuário para reconectar usando connect_google.",
+            },
+          ],
+          details: { action: "error" as const, reason: "token_revoked" },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Google API error: ${msg}` }],
+        details: { action: "error" as const, error: msg },
+      };
+    }
 
     // -----------------------------------------------------------------------
     // Hook: before_agent_start — inject org + project context
     // -----------------------------------------------------------------------
 
-    api.on("before_agent_start", async () => {
+    api.on("before_agent_start", async (_event, ctx) => {
+      const cfg = cfgFromCtx(ctx);
       try {
         const projectIds = await getAgentProjects(cfg);
         const extensionContext = await loadContext(cfg, projectIds);
@@ -71,30 +157,37 @@ const memorySecondBrainPlugin = {
         if (!extensionContext) return undefined;
         return { prependContext: extensionContext };
       } catch (err) {
-        api.logger.warn(`[memory-second-brain] load failed: ${String(err)}`);
+        api.logger.warn(`[memory-second-brain] load failed (${cfg.agentId}): ${String(err)}`);
         return undefined;
       }
     });
 
-    // -----------------------------------------------------------------------
-    // Tool: write_user — LLM updates USER.md (always-on user profile)
-    // USER.md is injected into every system prompt by OpenClaw core,
-    // so it's the right place for info that must always be present
-    // (name, preferences, language, communication style, etc.)
-    // -----------------------------------------------------------------------
-
-    const MAX_USER_SIZE = 10_000; // 10 KB
-    const MAX_WRITES_PER_SESSION = 3;
-    let writeCount = 0;
-
     // Reset write counter on each new session
-    api.on("before_agent_start", async () => {
-      writeCount = 0;
+    api.on("before_agent_start", async (_event, ctx) => {
+      const cfg = cfgFromCtx(ctx); // validates agentId
+      writeCountMap.set(cfg.agentId, 0);
       return undefined;
     });
 
+    // Load skill secrets (Google token no longer written to process.env —
+    // each tool fetches its own token via getGoogleClient(cfg) per-request)
+    api.on("before_agent_start", async (_event, ctx) => {
+      const cfg = cfgFromCtx(ctx);
+
+      // SECURITY: always clear process-wide env var to prevent cross-agent leakage
+      delete process.env.GOOGLE_WORKSPACE_CLI_TOKEN;
+
+      await ensureSkillSecrets(cfg);
+
+      return undefined;
+    });
+
+    // -----------------------------------------------------------------------
+    // Tool: write_user — LLM updates USER.md (always-on user profile)
+    // -----------------------------------------------------------------------
+
     api.registerTool(
-      {
+      (ctx) => ({
         name: "write_user",
         label: "Write User Profile",
         description:
@@ -112,6 +205,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { content } = params as { content: string };
 
           if (content.length > MAX_USER_SIZE) {
@@ -126,7 +220,9 @@ const memorySecondBrainPlugin = {
             };
           }
 
-          if (++writeCount > MAX_WRITES_PER_SESSION) {
+          const count = (writeCountMap.get(cfg.agentId) ?? 0) + 1;
+          writeCountMap.set(cfg.agentId, count);
+          if (count > MAX_WRITES_PER_SESSION) {
             return {
               content: [
                 {
@@ -153,7 +249,7 @@ const memorySecondBrainPlugin = {
             };
           }
         },
-      },
+      }),
       { name: "write_user" },
     );
 
@@ -162,7 +258,7 @@ const memorySecondBrainPlugin = {
     // -----------------------------------------------------------------------
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "list_skills",
         label: "List Skills",
         description:
@@ -170,6 +266,7 @@ const memorySecondBrainPlugin = {
           "Shows skill name, description, and tier (org or personal).",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
+          const cfg = cfgFromCtx(ctx);
           try {
             const skills = await listSkills(cfg);
             if (skills.length === 0) {
@@ -196,7 +293,7 @@ const memorySecondBrainPlugin = {
             };
           }
         },
-      },
+      }),
       { name: "list_skills" },
     );
 
@@ -205,7 +302,7 @@ const memorySecondBrainPlugin = {
     // -----------------------------------------------------------------------
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "write_skill",
         label: "Write Skill",
         description:
@@ -228,6 +325,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { name, content } = params as { name: string; content: string };
 
           try {
@@ -252,48 +350,16 @@ const memorySecondBrainPlugin = {
             };
           }
         },
-      },
+      }),
       { name: "write_skill" },
     );
 
     // -----------------------------------------------------------------------
     // Tool: web_search — search the web via Brave Search API
-    // API key loaded from skill_secrets table, never exposed to LLM
     // -----------------------------------------------------------------------
 
-    let skillSecrets: Map<string, Map<string, string>> = new Map();
-    let skillSecretsLoaded = false;
-
-    async function ensureSkillSecrets(): Promise<Map<string, Map<string, string>>> {
-      if (!skillSecretsLoaded) {
-        try {
-          skillSecrets = await getSkillSecrets(cfg);
-          skillSecretsLoaded = true;
-        } catch (err) {
-          api.logger.warn(`[memory-second-brain] skill secrets: ${String(err)}`);
-        }
-      }
-      return skillSecrets;
-    }
-
-    api.on("before_agent_start", async () => {
-      await ensureSkillSecrets();
-
-      // Bridge Google OAuth token for gws CLI (exec tool inherits env vars)
-      try {
-        const token = await getGoogleAccessToken(cfg);
-        if (token) {
-          process.env.GOOGLE_WORKSPACE_CLI_TOKEN = token;
-        }
-      } catch {
-        // User hasn't connected Google yet — gws commands will prompt to auth
-      }
-
-      return undefined;
-    });
-
     api.registerTool(
-      {
+      (ctx) => ({
         name: "web_search",
         label: "Web Search",
         description:
@@ -315,10 +381,11 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { query, count: rawCount } = params as { query: string; count?: number };
           const count = Math.min(Math.max(rawCount ?? 5, 1), 10);
 
-          const secrets = await ensureSkillSecrets();
+          const secrets = await ensureSkillSecrets(cfg);
           const braveSecrets = secrets.get("brave-search");
           const apiKey = braveSecrets?.get("BRAVE_API_KEY");
 
@@ -400,20 +467,16 @@ const memorySecondBrainPlugin = {
             };
           }
         },
-      },
+      }),
       { name: "web_search" },
     );
 
     // -----------------------------------------------------------------------
     // Tool: browse_url — read a web page via Jina Reader API
-    // Returns the page content as markdown. Handles JS-rendered SPAs.
-    // Optional JINA_API_KEY from skill_secrets (works without, lower rate limit).
     // -----------------------------------------------------------------------
 
-    const MAX_BROWSE_CONTENT = 12_000;
-
     api.registerTool(
-      {
+      (ctx) => ({
         name: "browse_url",
         label: "Browse URL",
         description:
@@ -428,8 +491,9 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { url } = params as { url: string };
-          const secrets = await ensureSkillSecrets();
+          const secrets = await ensureSkillSecrets(cfg);
           const jinaKey = secrets.get("jina")?.get("JINA_API_KEY");
 
           try {
@@ -458,7 +522,7 @@ const memorySecondBrainPlugin = {
             };
           }
         },
-      },
+      }),
       { name: "browse_url" },
     );
 
@@ -466,41 +530,10 @@ const memorySecondBrainPlugin = {
     // Google Workspace tools — per-user OAuth tokens from agent_credentials
     // -----------------------------------------------------------------------
 
-    const googleNotConnected = {
-      content: [
-        {
-          type: "text" as const,
-          text: "Google não está conectado. Peça ao usuário para conectar usando connect_google.",
-        },
-      ],
-      details: { action: "rejected" as const, reason: "not_connected" },
-    };
-
-    function googleError(err: unknown) {
-      const msg = String(err);
-      // Token revoked or invalid
-      if (msg.includes("invalid_grant") || msg.includes("Token has been expired or revoked")) {
-        deleteAgentCredential(cfg, "google").catch(() => {});
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "Acesso ao Google foi revogado. Peça ao usuário para reconectar usando connect_google.",
-            },
-          ],
-          details: { action: "error" as const, reason: "token_revoked" },
-        };
-      }
-      return {
-        content: [{ type: "text" as const, text: `Google API error: ${msg}` }],
-        details: { action: "error" as const, error: msg },
-      };
-    }
-
     // Tool: connect_google
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "connect_google",
         label: "Connect Google",
         description:
@@ -509,6 +542,8 @@ const memorySecondBrainPlugin = {
           "Use when the user wants to access their emails, calendar, or Drive files.",
         parameters: Type.Object({}, { additionalProperties: false }),
         async execute() {
+          const cfg = cfgFromCtx(ctx);
+
           // Check if already connected
           const existing = await getAgentCredential(cfg, "google");
           if (existing) {
@@ -554,14 +589,14 @@ const memorySecondBrainPlugin = {
             details: { action: "auth_url_generated" },
           };
         },
-      },
+      }),
       { name: "connect_google" },
     );
 
     // Tool: gmail_search
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "gmail_search",
         label: "Gmail Search",
         description:
@@ -579,6 +614,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { query, maxResults: rawMax } = params as { query: string; maxResults?: number };
           const max = Math.min(Math.max(rawMax ?? 5, 1), 20);
 
@@ -611,17 +647,17 @@ const memorySecondBrainPlugin = {
               details: { action: "searched", query, count: results.length },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "gmail_search" },
     );
 
     // Tool: gmail_read
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "gmail_read",
         label: "Gmail Read",
         description:
@@ -635,6 +671,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { messageId } = params as { messageId: string };
 
           try {
@@ -655,17 +692,17 @@ const memorySecondBrainPlugin = {
               details: { action: "read", messageId },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "gmail_read" },
     );
 
     // Tool: calendar_list
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "calendar_list",
         label: "Calendar List",
         description:
@@ -686,6 +723,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const {
             timeMin: rawMin,
             timeMax: rawMax,
@@ -727,17 +765,17 @@ const memorySecondBrainPlugin = {
               details: { action: "listed", count: events.length },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "calendar_list" },
     );
 
     // Tool: calendar_create
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "calendar_create",
         label: "Calendar Create",
         description: "Create a new calendar event.",
@@ -757,6 +795,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const p = params as {
             summary: string;
             start: string;
@@ -778,17 +817,17 @@ const memorySecondBrainPlugin = {
               details: { action: "created", eventId: event.id },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "calendar_create" },
     );
 
     // Tool: drive_search
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "drive_search",
         label: "Drive Search",
         description: "Search for files in the user's Google Drive.",
@@ -802,6 +841,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { query, maxResults: rawMax } = params as { query: string; maxResults?: number };
           const max = Math.min(Math.max(rawMax ?? 10, 1), 30);
 
@@ -837,17 +877,17 @@ const memorySecondBrainPlugin = {
               details: { action: "searched", query, count: files.length },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "drive_search" },
     );
 
     // Tool: drive_read
 
     api.registerTool(
-      {
+      (ctx) => ({
         name: "drive_read",
         label: "Drive Read",
         description:
@@ -860,6 +900,7 @@ const memorySecondBrainPlugin = {
           { additionalProperties: false },
         ),
         async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
           const { fileId } = params as { fileId: string };
 
           try {
@@ -876,10 +917,10 @@ const memorySecondBrainPlugin = {
               details: { action: "read", fileId, fileName: result.name },
             };
           } catch (err) {
-            return googleError(err);
+            return googleError(cfg, err);
           }
         },
-      },
+      }),
       { name: "drive_read" },
     );
   },
