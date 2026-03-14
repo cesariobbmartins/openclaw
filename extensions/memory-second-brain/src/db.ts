@@ -73,6 +73,47 @@ export async function getSkillSecrets(
 }
 
 // ---------------------------------------------------------------------------
+// Visible agents — personal + allowed functionals (DEC-014)
+// ---------------------------------------------------------------------------
+
+export interface AgentRow {
+  agent_id: string;
+  org_id: string;
+  name: string;
+  type: string;
+  active: boolean;
+  created_by: string | null;
+}
+
+export async function getVisibleAgents(cfg: PluginConfig): Promise<AgentRow[]> {
+  const db = getPool(cfg);
+  if (!db) return [];
+
+  try {
+    const { rows } = await db.query<AgentRow>(
+      `SELECT a.agent_id, a.org_id, a.name, a.type, a.active, a.created_by
+         FROM agents a
+        WHERE a.org_id = $1
+          AND a.active = true
+          AND (
+            a.type = 'personal'
+            OR EXISTS (
+              SELECT 1 FROM agent_allowlist al
+               WHERE al.agent_id = a.agent_id
+                 AND (al.allowed_agent_id = $2 OR al.allowed_agent_id = '*')
+            )
+          )
+        ORDER BY a.type, a.name`,
+      [cfg.org, cfg.agentId],
+    );
+    return rows;
+  } catch (err) {
+    console.warn("[memory-second-brain] failed to load visible agents:", String(err));
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Agent credentials (per-agent OAuth tokens)
 // ---------------------------------------------------------------------------
 

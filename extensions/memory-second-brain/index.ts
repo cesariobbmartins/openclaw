@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { getAgentProjects, getSkillSecrets } from "./src/db.js";
+import { getAgentProjects, getSkillSecrets, getVisibleAgents } from "./src/db.js";
 import { getAgentCredential, deleteAgentCredential } from "./src/db.js";
 import {
   generateGoogleAuthUrl,
@@ -36,6 +36,8 @@ import type { PluginConfig } from "./src/types.js";
 //   - Tag context: TAGS.md injected via prependContext for tag consistency
 //   - web_search tool: search the web via Brave Search (key from skill_secrets)
 //   - browse_url tool: read a web page via Jina Reader API (returns markdown)
+//   - list_agents tool: discover agents in the org (DEC-014)
+//   - create_functional_agent tool: create functional agents (DEC-014)
 //   - Google tools: connect_google, gmail_search, gmail_read,
 //     calendar_list, calendar_create, drive_search, drive_read
 // ---------------------------------------------------------------------------
@@ -524,6 +526,167 @@ const memorySecondBrainPlugin = {
         },
       }),
       { name: "browse_url" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Tool: list_agents — discover agents in the org (DEC-014)
+    // -----------------------------------------------------------------------
+
+    api.registerTool(
+      (ctx) => ({
+        name: "list_agents",
+        label: "List Agents",
+        description:
+          "List all agents you can communicate with in the organization. " +
+          "Shows personal agents and functional agents you have access to. " +
+          "Use this to discover agent IDs before using sessions_send.",
+        parameters: Type.Object({}, { additionalProperties: false }),
+        async execute() {
+          const cfg = cfgFromCtx(ctx);
+          try {
+            const agents = await getVisibleAgents(cfg);
+            if (agents.length === 0) {
+              return {
+                content: [
+                  { type: "text" as const, text: "Nenhum agente encontrado na organização." },
+                ],
+                details: { action: "listed", count: 0 },
+              };
+            }
+
+            const lines = agents.map((a) => {
+              let line = `- **${a.name}** (ID: \`${a.agent_id}\`) [${a.type}]`;
+              if (a.created_by) line += ` — criado por \`${a.created_by}\``;
+              return line;
+            });
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Agentes da organização (${agents.length}):\n\n${lines.join("\n")}`,
+                },
+              ],
+              details: { action: "listed", count: agents.length },
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: `Falha ao listar agentes: ${String(err)}` }],
+              details: { action: "error", error: String(err) },
+            };
+          }
+        },
+      }),
+      { name: "list_agents" },
+    );
+
+    // -----------------------------------------------------------------------
+    // Tool: create_functional_agent — create a new functional agent (DEC-014)
+    // -----------------------------------------------------------------------
+
+    api.registerTool(
+      (ctx) => ({
+        name: "create_functional_agent",
+        label: "Create Functional Agent",
+        description:
+          "Create a new functional agent for the organization. " +
+          "Functional agents serve a specific purpose (onboarding, FAQ, reports) and " +
+          "can be accessed by agents in the allowlist via sessions_send. " +
+          "You (the creator) are automatically added to the allowlist.",
+        parameters: Type.Object(
+          {
+            name: Type.String({
+              description: "Name for the functional agent (e.g. 'Onboarding Bot', 'FAQ Produto')",
+            }),
+            hint: Type.String({
+              description:
+                "Short description of the agent's mission (used to generate its identity)",
+            }),
+            allowlist: Type.Optional(
+              Type.Array(Type.String(), {
+                description: "Agent IDs to add to the allowlist (you are added automatically)",
+              }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params) {
+          const cfg = cfgFromCtx(ctx);
+          const { name, hint, allowlist } = params as {
+            name: string;
+            hint: string;
+            allowlist?: string[];
+          };
+
+          const hubUrl = process.env.HUB_URL;
+          if (!hubUrl) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "HUB_URL não está configurado. Não é possível criar agentes funcionais.",
+                },
+              ],
+              details: { action: "error", reason: "no_hub_url" },
+            };
+          }
+
+          try {
+            const res = await fetch(`${hubUrl}/api/internal/create-functional`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                name,
+                hint,
+                creatorId: cfg.agentId,
+                orgId: cfg.org,
+                allowlist,
+              }),
+              signal: AbortSignal.timeout(30_000),
+            });
+
+            if (!res.ok) {
+              const detail = await res.text().catch(() => "");
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `Falha ao criar agente funcional (${res.status}): ${detail}`,
+                  },
+                ],
+                details: { action: "error", status: res.status },
+              };
+            }
+
+            const result = (await res.json()) as { agentId: string; name: string };
+
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text:
+                    `Agente funcional criado com sucesso!\n\n` +
+                    `- **Nome:** ${result.name}\n` +
+                    `- **Agent ID:** \`${result.agentId}\`\n\n` +
+                    `Use \`sessions_send\` com o ID \`${result.agentId}\` para se comunicar com ele.`,
+                },
+              ],
+              details: { action: "created", agentId: result.agentId },
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Falha ao criar agente funcional: ${String(err)}`,
+                },
+              ],
+              details: { action: "error", error: String(err) },
+            };
+          }
+        },
+      }),
+      { name: "create_functional_agent" },
     );
 
     // -----------------------------------------------------------------------
