@@ -55,11 +55,12 @@ export interface DriveFile {
 // ---------------------------------------------------------------------------
 
 const GOOGLE_SCOPES = [
-  "https://www.googleapis.com/auth/gmail.readonly", // read-only
-  "https://www.googleapis.com/auth/calendar", // read + write (create events)
-  "https://www.googleapis.com/auth/drive.readonly", // read-only
-  "https://www.googleapis.com/auth/documents.readonly", // read-only
-  "https://www.googleapis.com/auth/spreadsheets.readonly", // read-only
+  "https://www.googleapis.com/auth/gmail.readonly", // read all emails
+  "https://www.googleapis.com/auth/gmail.send", // send emails
+  "https://www.googleapis.com/auth/gmail.compose", // create drafts
+  "https://www.googleapis.com/auth/calendar", // read + write events
+  "https://www.googleapis.com/auth/drive.readonly", // read all files
+  "https://www.googleapis.com/auth/drive.file", // write only app-created files
   "https://www.googleapis.com/auth/tasks.readonly", // read-only
   "https://www.googleapis.com/auth/contacts.readonly", // read-only
   "https://www.googleapis.com/auth/meetings.space.readonly", // read-only
